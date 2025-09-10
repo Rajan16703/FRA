@@ -2,6 +2,7 @@ import React, { useState, useEffect } from "react";
 import "./App.css";
 import { BrowserRouter, Routes, Route, Link, useLocation } from "react-router-dom";
 import axios from "axios";
+import DocumentManager from "./DocumentManager";
 import { 
   Home, 
   Map, 
@@ -29,7 +30,8 @@ import {
   Award,
   Shield,
   Zap,
-  Star
+  Star,
+  Upload
 } from "lucide-react";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
