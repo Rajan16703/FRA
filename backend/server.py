@@ -1,4 +1,5 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Query
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Query, UploadFile, File, Form
+from fastapi.responses import FileResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -10,10 +11,18 @@ from typing import List, Optional, Dict, Any
 import uuid
 from datetime import datetime
 from enum import Enum
+import aiofiles
+import mimetypes
+import random
+import string
 
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
+
+# Create uploads directory
+UPLOAD_DIR = ROOT_DIR / "uploads"
+UPLOAD_DIR.mkdir(exist_ok=True)
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
@@ -45,6 +54,22 @@ class UserRole(str, Enum):
     FIELD_OFFICER = "field_officer"
     VERIFIER = "verifier"
     VIEWER = "viewer"
+
+class DocumentType(str, Enum):
+    IDENTITY_PROOF = "identity_proof"
+    ADDRESS_PROOF = "address_proof"
+    LAND_DOCUMENT = "land_document"
+    SURVEY_SETTLEMENT = "survey_settlement"
+    FOREST_CLEARANCE = "forest_clearance"
+    PHOTOGRAPH = "photograph"
+    OTHER = "other"
+
+class DocumentStatus(str, Enum):
+    UPLOADED = "uploaded"
+    PROCESSING = "processing"
+    OCR_COMPLETED = "ocr_completed"
+    VERIFIED = "verified"
+    REJECTED = "rejected"
 
 # Models
 class Village(BaseModel):
@@ -84,13 +109,30 @@ class User(BaseModel):
     state: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
-class OCRDocument(BaseModel):
+class Document(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     filename: str
-    extracted_text: str
-    confidence_score: float
-    claim_id: str
-    processed_at: datetime = Field(default_factory=datetime.utcnow)
+    original_filename: str
+    file_path: str
+    file_size: int
+    mime_type: str
+    document_type: DocumentType
+    status: DocumentStatus
+    claim_id: Optional[str] = None
+    version: int = 1
+    parent_document_id: Optional[str] = None  # For versioning
+    ocr_text: Optional[str] = None
+    ocr_confidence: float = 0.0
+    ocr_metadata: Dict[str, Any] = {}
+    uploaded_by: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+class OCRResult(BaseModel):
+    text: str
+    confidence: float
+    metadata: Dict[str, Any] = {}
+    extracted_fields: Dict[str, str] = {}
 
 class Analytics(BaseModel):
     total_villages: int
@@ -101,6 +143,8 @@ class Analytics(BaseModel):
     average_processing_time: float
     ocr_accuracy: float
     scheme_integration_count: int
+    total_documents: int = 0
+    documents_with_ocr: int = 0
 
 # Create models for requests
 class ClaimCreate(BaseModel):
@@ -115,11 +159,445 @@ class ClaimUpdate(BaseModel):
     assigned_officer: Optional[str] = None
     linked_schemes: Optional[List[str]] = None
 
+class DocumentUpdate(BaseModel):
+    document_type: Optional[DocumentType] = None
+    status: Optional[DocumentStatus] = None
+
+# Helper functions
+def generate_filename(original_filename: str) -> str:
+    """Generate unique filename while preserving extension"""
+    name, ext = os.path.splitext(original_filename)
+    unique_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+    return f"{unique_id}_{name}{ext}"
+
+async def mock_ocr_processing(file_path: str, mime_type: str) -> OCRResult:
+    """Mock OCR processing - replace with real OCR service"""
+    
+    # Simulate processing delay
+    await asyncio.sleep(0.5)
+    
+    # Mock OCR text based on file type
+    if "pdf" in mime_type.lower():
+        mock_text = f"""
+        FOREST RIGHTS CERTIFICATE
+        
+        Government of India
+        Ministry of Environment, Forest and Climate Change
+        
+        Certificate No: FRC/{random.randint(1000, 9999)}/2024
+        
+        This is to certify that Shri/Smt. [Beneficiary Name] 
+        Son/Daughter of [Father's Name]
+        Village: [Village Name]
+        District: [District Name]
+        State: [State Name]
+        
+        is hereby granted Individual Forest Rights under 
+        The Scheduled Tribes and Other Traditional Forest 
+        Dwellers (Recognition of Forest Rights) Act, 2006
+        
+        Area Granted: {random.uniform(1.0, 5.0):.2f} hectares
+        Survey Number: {random.randint(100, 999)}/{random.randint(1, 50)}
+        
+        Date of Issue: {datetime.now().strftime('%d/%m/%Y')}
+        
+        Authorized Signatory
+        District Collector
+        """
+    else:
+        # For images
+        mock_text = f"""
+        Aadhaar Card / Identity Document
+        
+        Name: [Name from document]
+        DOB: {random.randint(1, 28)}/{random.randint(1, 12)}/{random.randint(1960, 2000)}
+        Address: Village [Village Name], District [District Name]
+        Aadhaar: XXXX-XXXX-{random.randint(1000, 9999)}
+        """
+    
+    # Extract some fields
+    extracted_fields = {
+        "beneficiary_name": f"Beneficiary {random.randint(1, 100)}",
+        "village": f"Village {random.randint(1, 50)}",
+        "area": f"{random.uniform(1.0, 5.0):.2f}",
+        "survey_number": f"{random.randint(100, 999)}/{random.randint(1, 50)}"
+    }
+    
+    confidence = random.uniform(0.75, 0.98)
+    
+    return OCRResult(
+        text=mock_text.strip(),
+        confidence=confidence,
+        metadata={
+            "processing_time": random.uniform(0.5, 2.0),
+            "language": "english",
+            "pages": 1 if "image" in mime_type else random.randint(1, 5)
+        },
+        extracted_fields=extracted_fields
+    )
+
 # Routes
 
 @api_router.get("/")
 async def root():
     return {"message": "FRA-Connect API - Forest Rights Atlas & Decision Support System"}
+
+# Document routes
+@api_router.post("/documents/upload", response_model=Document)
+async def upload_document(
+    file: UploadFile = File(...),
+    document_type: DocumentType = Form(...),
+    claim_id: Optional[str] = Form(None),
+    uploaded_by: str = Form("admin")
+):
+    """Upload a new document"""
+    
+    # Validate file type
+    allowed_types = [
+        "application/pdf",
+        "image/jpeg",
+        "image/jpg", 
+        "image/png",
+        "image/tiff",
+        "image/bmp"
+    ]
+    
+    if file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="File type not supported")
+    
+    # Generate unique filename
+    filename = generate_filename(file.filename)
+    file_path = UPLOAD_DIR / filename
+    
+    # Save file
+    async with aiofiles.open(file_path, 'wb') as f:
+        content = await file.read()
+        await f.write(content)
+    
+    # Create document record
+    document = Document(
+        filename=filename,
+        original_filename=file.filename,
+        file_path=str(file_path),
+        file_size=len(content),
+        mime_type=file.content_type,
+        document_type=document_type,
+        status=DocumentStatus.UPLOADED,
+        claim_id=claim_id,
+        uploaded_by=uploaded_by
+    )
+    
+    # Save to database
+    doc_dict = document.dict()
+    await db.documents.insert_one(doc_dict)
+    
+    return document
+
+@api_router.post("/documents/{document_id}/ocr")
+async def process_ocr(document_id: str):
+    """Process OCR for a document"""
+    
+    # Get document
+    doc = await db.documents.find_one({"id": document_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    # Update status to processing
+    await db.documents.update_one(
+        {"id": document_id},
+        {"$set": {"status": "processing", "updated_at": datetime.utcnow()}}
+    )
+    
+    # Mock OCR processing
+    ocr_result = await mock_ocr_processing(doc["file_path"], doc["mime_type"])
+    
+    # Update document with OCR results
+    update_data = {
+        "status": "ocr_completed",
+        "ocr_text": ocr_result.text,
+        "ocr_confidence": ocr_result.confidence,
+        "ocr_metadata": ocr_result.metadata,
+        "updated_at": datetime.utcnow()
+    }
+    
+    await db.documents.update_one({"id": document_id}, {"$set": update_data})
+    
+    return {
+        "document_id": document_id,
+        "status": "ocr_completed",
+        "ocr_result": ocr_result
+    }
+
+@api_router.get("/documents", response_model=List[Document])
+async def get_documents(
+    claim_id: Optional[str] = Query(None),
+    document_type: Optional[DocumentType] = Query(None),
+    status: Optional[DocumentStatus] = Query(None),
+    limit: int = Query(50, le=100)
+):
+    """Get documents with filtering"""
+    filter_dict = {}
+    if claim_id:
+        filter_dict["claim_id"] = claim_id
+    if document_type:
+        filter_dict["document_type"] = document_type
+    if status:
+        filter_dict["status"] = status
+    
+    documents = await db.documents.find(filter_dict).limit(limit).to_list(length=None)
+    return [Document(**doc) for doc in documents]
+
+@api_router.get("/documents/{document_id}", response_model=Document)
+async def get_document(document_id: str):
+    """Get specific document"""
+    doc = await db.documents.find_one({"id": document_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return Document(**doc)
+
+@api_router.put("/documents/{document_id}", response_model=Document)
+async def update_document(document_id: str, update_data: DocumentUpdate):
+    """Update document details"""
+    doc = await db.documents.find_one({"id": document_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    update_dict = update_data.dict(exclude_unset=True)
+    update_dict["updated_at"] = datetime.utcnow()
+    
+    await db.documents.update_one({"id": document_id}, {"$set": update_dict})
+    
+    updated_doc = await db.documents.find_one({"id": document_id})
+    return Document(**updated_doc)
+
+@api_router.delete("/documents/{document_id}")
+async def delete_document(document_id: str):
+    """Delete document"""
+    doc = await db.documents.find_one({"id": document_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    # Delete file from filesystem
+    try:
+        os.remove(doc["file_path"])
+    except OSError:
+        pass  # File might not exist
+    
+    # Delete from database
+    await db.documents.delete_one({"id": document_id})
+    
+    return {"message": "Document deleted successfully"}
+
+@api_router.get("/documents/{document_id}/download")
+async def download_document(document_id: str):
+    """Download document file"""
+    doc = await db.documents.find_one({"id": document_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    file_path = doc["file_path"]
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    return FileResponse(
+        path=file_path,
+        filename=doc["original_filename"],
+        media_type=doc["mime_type"]
+    )
+
+@api_router.post("/documents/{document_id}/version", response_model=Document)
+async def create_document_version(
+    document_id: str,
+    file: UploadFile = File(...),
+    uploaded_by: str = Form("admin")
+):
+    """Create a new version of an existing document"""
+    
+    # Get parent document
+    parent_doc = await db.documents.find_one({"id": document_id})
+    if not parent_doc:
+        raise HTTPException(status_code=404, detail="Parent document not found")
+    
+    # Get current max version for this document family
+    max_version = await db.documents.find({
+        "$or": [
+            {"id": document_id},
+            {"parent_document_id": document_id}
+        ]
+    }).sort("version", -1).limit(1).to_list(1)
+    
+    new_version = (max_version[0]["version"] if max_version else 1) + 1
+    
+    # Generate unique filename
+    filename = generate_filename(file.filename)
+    file_path = UPLOAD_DIR / filename
+    
+    # Save file
+    async with aiofiles.open(file_path, 'wb') as f:
+        content = await file.read()
+        await f.write(content)
+    
+    # Create new document version
+    new_doc = Document(
+        filename=filename,
+        original_filename=file.filename,
+        file_path=str(file_path),
+        file_size=len(content),
+        mime_type=file.content_type,
+        document_type=parent_doc["document_type"],
+        status=DocumentStatus.UPLOADED,
+        claim_id=parent_doc["claim_id"],
+        version=new_version,
+        parent_document_id=document_id,
+        uploaded_by=uploaded_by
+    )
+    
+    # Save to database
+    doc_dict = new_doc.dict()
+    await db.documents.insert_one(doc_dict)
+    
+    return new_doc
+
+@api_router.get("/documents/{document_id}/versions", response_model=List[Document])
+async def get_document_versions(document_id: str):
+    """Get all versions of a document"""
+    versions = await db.documents.find({
+        "$or": [
+            {"id": document_id},
+            {"parent_document_id": document_id}
+        ]
+    }).sort("version", 1).to_list(length=None)
+    
+    return [Document(**doc) for doc in versions]
+
+@api_router.post("/documents/bulk-upload")
+async def bulk_upload_documents(
+    files: List[UploadFile] = File(...),
+    document_type: DocumentType = Form(...),
+    claim_id: Optional[str] = Form(None),
+    uploaded_by: str = Form("admin")
+):
+    """Upload multiple documents at once"""
+    
+    uploaded_docs = []
+    failed_uploads = []
+    
+    for file in files:
+        try:
+            # Validate file type
+            allowed_types = [
+                "application/pdf",
+                "image/jpeg",
+                "image/jpg", 
+                "image/png",
+                "image/tiff",
+                "image/bmp"
+            ]
+            
+            if file.content_type not in allowed_types:
+                failed_uploads.append({
+                    "filename": file.filename,
+                    "error": "File type not supported"
+                })
+                continue
+            
+            # Generate unique filename
+            filename = generate_filename(file.filename)
+            file_path = UPLOAD_DIR / filename
+            
+            # Save file
+            async with aiofiles.open(file_path, 'wb') as f:
+                content = await file.read()
+                await f.write(content)
+            
+            # Create document record
+            document = Document(
+                filename=filename,
+                original_filename=file.filename,
+                file_path=str(file_path),
+                file_size=len(content),
+                mime_type=file.content_type,
+                document_type=document_type,
+                status=DocumentStatus.UPLOADED,
+                claim_id=claim_id,
+                uploaded_by=uploaded_by
+            )
+            
+            # Save to database
+            doc_dict = document.dict()
+            await db.documents.insert_one(doc_dict)
+            
+            uploaded_docs.append(document)
+            
+        except Exception as e:
+            failed_uploads.append({
+                "filename": file.filename,
+                "error": str(e)
+            })
+    
+    return {
+        "uploaded_documents": uploaded_docs,
+        "failed_uploads": failed_uploads,
+        "total_uploaded": len(uploaded_docs),
+        "total_failed": len(failed_uploads)
+    }
+
+@api_router.post("/documents/bulk-ocr")
+async def bulk_ocr_processing(document_ids: List[str]):
+    """Process OCR for multiple documents"""
+    
+    results = []
+    
+    for doc_id in document_ids:
+        try:
+            # Get document
+            doc = await db.documents.find_one({"id": doc_id})
+            if not doc:
+                results.append({
+                    "document_id": doc_id,
+                    "status": "error",
+                    "error": "Document not found"
+                })
+                continue
+            
+            # Update status to processing
+            await db.documents.update_one(
+                {"id": doc_id},
+                {"$set": {"status": "processing", "updated_at": datetime.utcnow()}}
+            )
+            
+            # Mock OCR processing
+            ocr_result = await mock_ocr_processing(doc["file_path"], doc["mime_type"])
+            
+            # Update document with OCR results
+            update_data = {
+                "status": "ocr_completed",
+                "ocr_text": ocr_result.text,
+                "ocr_confidence": ocr_result.confidence,
+                "ocr_metadata": ocr_result.metadata,
+                "updated_at": datetime.utcnow()
+            }
+            
+            await db.documents.update_one({"id": doc_id}, {"$set": update_data})
+            
+            results.append({
+                "document_id": doc_id,
+                "status": "completed",
+                "ocr_result": ocr_result
+            })
+            
+        except Exception as e:
+            results.append({
+                "document_id": doc_id,
+                "status": "error",
+                "error": str(e)
+            })
+    
+    return {
+        "results": results,
+        "total_processed": len([r for r in results if r["status"] == "completed"]),
+        "total_failed": len([r for r in results if r["status"] == "error"])
+    }
 
 # Village routes
 @api_router.get("/villages", response_model=List[Village])
@@ -234,6 +712,10 @@ async def get_analytics():
     approved_claims = await db.claims.count_documents({"status": "approved"})
     rejected_claims = await db.claims.count_documents({"status": "rejected"})
     
+    # Document analytics
+    total_documents = await db.documents.count_documents({})
+    documents_with_ocr = await db.documents.count_documents({"ocr_text": {"$ne": None}})
+    
     return Analytics(
         total_villages=total_villages,
         total_claims=total_claims,
@@ -242,7 +724,9 @@ async def get_analytics():
         rejected_claims=rejected_claims,
         average_processing_time=15.5,  # Mock data
         ocr_accuracy=0.92,  # Mock data
-        scheme_integration_count=150  # Mock data
+        scheme_integration_count=150,  # Mock data
+        total_documents=total_documents,
+        documents_with_ocr=documents_with_ocr
     )
 
 # Mock data generation routes
@@ -292,6 +776,45 @@ async def generate_mock_data():
             existing = await db.claims.find_one({"claim_number": claim.claim_number})
             if not existing:
                 await db.claims.insert_one(claim.dict())
+    
+    # Create some mock documents
+    claims = await db.claims.find().limit(2).to_list(length=None)
+    if claims:
+        for i, claim in enumerate(claims):
+            # Create mock document entries (without actual files for demo)
+            mock_docs = [
+                Document(
+                    filename=f"mock_identity_{i}.pdf",
+                    original_filename=f"identity_proof_{i+1}.pdf",
+                    file_path=f"/mock/path/identity_{i}.pdf",
+                    file_size=random.randint(100000, 500000),
+                    mime_type="application/pdf",
+                    document_type=DocumentType.IDENTITY_PROOF,
+                    status=DocumentStatus.OCR_COMPLETED,
+                    claim_id=claim["id"],
+                    uploaded_by="admin",
+                    ocr_text="Mock OCR text for identity document",
+                    ocr_confidence=random.uniform(0.85, 0.95)
+                ),
+                Document(
+                    filename=f"mock_land_{i}.pdf",
+                    original_filename=f"land_document_{i+1}.pdf",
+                    file_path=f"/mock/path/land_{i}.pdf",
+                    file_size=random.randint(150000, 300000),
+                    mime_type="application/pdf",
+                    document_type=DocumentType.LAND_DOCUMENT,
+                    status=DocumentStatus.VERIFIED,
+                    claim_id=claim["id"],
+                    uploaded_by="admin",
+                    ocr_text="Mock OCR text for land document",
+                    ocr_confidence=random.uniform(0.88, 0.96)
+                )
+            ]
+            
+            for doc in mock_docs:
+                existing = await db.documents.find_one({"filename": doc.filename})
+                if not existing:
+                    await db.documents.insert_one(doc.dict())
     
     return {"message": "Mock data generated successfully"}
 
@@ -417,3 +940,6 @@ logger = logging.getLogger(__name__)
 @app.on_event("shutdown")
 async def shutdown_db_client():
     client.close()
+
+# Import asyncio for OCR processing
+import asyncio
